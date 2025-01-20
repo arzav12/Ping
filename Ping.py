@@ -1,47 +1,73 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+import socket
+import sys
 import threading
 import queue
 import platform
 import subprocess
 import time
 from datetime import datetime
-import socket
 import re
-#ping Monitor
+
+class SingleInstanceChecker:
+    def __init__(self, port=12345):
+        self.port = port
+        
+    def check(self):
+        try:
+            # Try to create a socket server
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.bind(('localhost', self.port))
+            self.sock.listen(1)
+            return True
+        except socket.error:
+            return False
 
 class PingMonitor:
     def __init__(self, root):
+        # Check if another instance is running
+        self.instance_checker = SingleInstanceChecker()
+        if not self.instance_checker.check():
+            messagebox.showwarning("Warning", "Application is already running!")
+            root.destroy()
+            sys.exit(0)
+            
         self.root = root
         self.root.title("Advanced Network Ping Monitor")
         self.root.geometry("1000x700")
-
+        
         # Store hosts and their monitoring threads
         self.hosts = {}
         self.monitoring_threads = {}
         self.queue = queue.Queue()
-
+        
         # Create main frame
         self.main_frame = ttk.Frame(self.root, padding="10")
         self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # Create input frame
+        
+        # Create UI components (your existing code)
         self.create_input_frame()
-
-        # Create monitor frame
         self.create_monitor_frame()
-
-        # Create statistics frame
         self.create_stats_frame()
-
-        # Configure grid weights
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_columnconfigure(1, weight=1)
-
+        
+        # Handle window closing
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         # Start update thread
         self.update_thread = threading.Thread(target=self.update_display, daemon=True)
         self.update_thread.start()
+
+    def on_closing(self):
+        """Handle application shutdown"""
+        try:
+            # Clean up socket
+            if hasattr(self, 'instance_checker'):
+                self.instance_checker.sock.close()
+        except:
+            pass
+        self.root.destroy()
+        sys.exit(0)
 
     def create_input_frame(self):
         """Create the input frame with host and IP address fields"""
@@ -246,9 +272,8 @@ class PingMonitor:
 
         # Add host to monitoring
         self.hosts[(hostname, ip)] = self.tree.insert("", tk.END,
-                                                      values=(
-                                                      hostname, ip, "Initializing...", "", "", "", "", "", threshold,
-                                                      ""))
+                                                      values=(hostname, ip, "Initializing...", "", "", "", "", "", threshold,
+                                                              ""))
 
         # Start monitoring thread
         thread = threading.Thread(target=self.monitor_host,
@@ -336,7 +361,6 @@ class PingMonitor:
                 continue
             except Exception as e:
                 print(f"Error updating display: {e}")
-
 
 if __name__ == "__main__":
     root = tk.Tk()
