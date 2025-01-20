@@ -1,23 +1,22 @@
-# Use the official Python image as a base image
 FROM python:3.9-slim
 
-# Set environment variables to prevent Python from writing .pyc files and buffering stdout/stderr
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+# Set environment variables (using the correct format)
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # Set the working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install necessary system dependencies
 RUN apt-get update && \
-    apt-get install -y python3-tk && \
+    apt-get install -y python3-tk pkg-config gcc libmariadb-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy the current directory contents into the container
+# Copy project files
 COPY . /app
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Command to run the application
-CMD ["python", "ping_monitor.py"]
+# Command to run the application (replace with your command)
+CMD ["python", "app.py"]
