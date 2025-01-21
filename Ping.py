@@ -279,28 +279,8 @@ class PingMonitor:
 
         self.update_stats()
 
-    def monitor_host(self, hostname, ip, threshold):
-        """Monitor a host continuously"""
-        while self.running:
-            try:
-                ping_result = self.ping_host(ip)
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                if ping_result[0]:  # Successful ping
-                    ping_time = ping_result[1]
-                    status = "Good" if ping_time < threshold else ("High" if ping_time < threshold * 2 else "Critical")
-                    self.queue.put(
-                        (hostname, ip, status, ping_time, ping_time, ping_time, ping_time, 0, threshold, timestamp))
-                else:
-                    self.queue.put((hostname, ip, "Critical", None, None, None, None, 100, threshold, timestamp))
-
-                time.sleep(1)
-            except Exception as e:
-                print(f"Error monitoring {hostname}: {e}")
-                time.sleep(1)
-
-    def ping_host(self, ip):
-        """Ping a host and return success status and time"""
+    def ping(self, ip):
+        """Perform a single ping and return (ping_time, success)"""
         try:
             if platform.system().lower() == "windows":
                 cmd = f"ping -n 1 {ip}"
@@ -314,9 +294,41 @@ class PingMonitor:
             success = result.returncode == 0
             ping_time = (end_time - start_time) * 1000 if success else None
 
-            return success, ping_time
+            return ping_time, success
         except Exception:
-            return False, None
+            return None, False
+
+    def monitor_host(self, hostname, ip, threshold):
+        """Continuously monitor a host and update its status"""
+        ping_history = []
+        packet_loss = 0
+        total_pings = 0
+
+        while (hostname, ip) in self.hosts:
+            total_pings += 1
+            ping_time, success = self.ping(ip)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if success and ping_time is not None:
+                ping_history.append(ping_time)
+                if len(ping_history) > 100:  # Keep last 100 pings
+                    ping_history.pop(0)
+
+                min_ping = min(ping_history)
+                max_ping = max(ping_history)
+                avg_ping = sum(ping_history) / len(ping_history)
+                loss_percentage = (packet_loss / total_pings) * 100
+
+                status = "Good" if ping_time < threshold else "High"
+                self.queue.put((hostname, ip, status, ping_time, min_ping, max_ping, avg_ping,
+                                loss_percentage, threshold, timestamp))
+            else:
+                packet_loss += 1
+                loss_percentage = (packet_loss / total_pings) * 100
+                self.queue.put((hostname, ip, "Down", None, None, None, None,
+                                loss_percentage, threshold, timestamp))
+
+            time.sleep(2)  # Wait 2 seconds between pings
 
     def update_stats(self):
         """Update statistics display"""

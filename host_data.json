@@ -3,10 +3,5 @@
         "hostname": "g",
         "ip": "8.8.8.8",
         "threshold": "100.0"
-    },
-    {
-        "hostname": "Damdim",
-        "ip": "125.23.130.234",
-        "threshold": "100.0"
     }
 ]
