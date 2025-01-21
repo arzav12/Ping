@@ -1,110 +1,186 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import socket
-import sys
 import threading
 import queue
 import platform
 import subprocess
 import time
 from datetime import datetime
+import socket
 import re
+from tendo import singleton
+import sys
+import json
+import os
 
-class SingleInstanceChecker:
-    def __init__(self, port=12345):
-        self.port = port
-        
-    def check(self):
-        try:
-            # Try to create a socket server
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.bind(('localhost', self.port))
-            self.sock.listen(1)
-            return True
-        except socket.error:
-            return False
 
 class PingMonitor:
     def __init__(self, root):
-        # Check if another instance is running
-        self.instance_checker = SingleInstanceChecker()
-        if not self.instance_checker.check():
-            messagebox.showwarning("Warning", "Application is already running!")
-            root.destroy()
-            sys.exit(0)
-            
         self.root = root
         self.root.title("Advanced Network Ping Monitor")
         self.root.geometry("1000x700")
-        
+
+        # Data storage file path
+        self.data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'host_data.json')
+
+        # Add window control
+        self.root.withdraw()  # Hide initially
+        self.running = True
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         # Store hosts and their monitoring threads
         self.hosts = {}
         self.monitoring_threads = {}
         self.queue = queue.Queue()
-        
+
         # Create main frame
         self.main_frame = ttk.Frame(self.root, padding="10")
         self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Create UI components (your existing code)
+
+        # Create frames
         self.create_input_frame()
         self.create_monitor_frame()
         self.create_stats_frame()
-        
-        # Handle window closing
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
+
+        # Configure grid weights
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(1, weight=1)
+
+        # Load saved hosts
+        self.load_hosts()
+
         # Start update thread
         self.update_thread = threading.Thread(target=self.update_display, daemon=True)
         self.update_thread.start()
 
-    def on_closing(self):
-        """Handle application shutdown"""
+        # Show window after initialization
+        self.root.after(100, self.root.deiconify)
+
+    def load_hosts(self):
+        """Load saved hosts from JSON file"""
         try:
-            # Clean up socket
-            if hasattr(self, 'instance_checker'):
-                self.instance_checker.sock.close()
-        except:
-            pass
-        self.root.destroy()
-        sys.exit(0)
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r') as f:
+                    saved_hosts = json.load(f)
+                    for host_data in saved_hosts:
+                        self.add_host_from_data(
+                            host_data['hostname'],
+                            host_data['ip'],
+                            float(host_data['threshold'])
+                        )
+        except Exception as e:
+            messagebox.showwarning("Warning", f"Error loading saved hosts: {str(e)}")
+
+    def save_hosts(self):
+        """Save hosts to JSON file"""
+        try:
+            hosts_data = []
+            for (hostname, ip) in self.hosts.keys():
+                item = self.hosts[(hostname, ip)]
+                values = self.tree.item(item)['values']
+                hosts_data.append({
+                    'hostname': hostname,
+                    'ip': ip,
+                    'threshold': values[8]  # threshold value
+                })
+
+            with open(self.data_file, 'w') as f:
+                json.dump(hosts_data, f, indent=4)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"Error saving hosts: {str(e)}")
+
+    def add_host_from_data(self, hostname, ip, threshold):
+        """Add a host from saved data"""
+        host_key = (hostname, ip)
+        if host_key not in self.hosts:
+            item = self.tree.insert("", tk.END, values=(
+                hostname, ip, "Unknown", "N/A", "N/A", "N/A", "N/A", "N/A", threshold, "N/A"
+            ))
+            self.hosts[host_key] = item
+
+            thread = threading.Thread(
+                target=self.monitor_host,
+                args=(hostname, ip, threshold),
+                daemon=True
+            )
+            self.monitoring_threads[host_key] = thread
+            thread.start()
 
     def create_input_frame(self):
-        """Create the input frame with host and IP address fields"""
-        self.input_frame = ttk.LabelFrame(self.main_frame, text="Add New Host", padding="10")
-        self.input_frame.grid(row=0, column=0, columnspan=2, pady=10, sticky=(tk.W, tk.E))
+        self.input_frame = ttk.LabelFrame(self.main_frame, text="Add Host", padding="5")
+        self.input_frame.grid(row=0, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
 
-        # Hostname input
+        # Host entry
         ttk.Label(self.input_frame, text="Hostname:").grid(row=0, column=0, padx=5)
-        self.hostname_entry = ttk.Entry(self.input_frame, width=30)
+        self.hostname_entry = ttk.Entry(self.input_frame)
         self.hostname_entry.grid(row=0, column=1, padx=5)
 
-        # IP address input
+        # IP entry
         ttk.Label(self.input_frame, text="IP Address:").grid(row=0, column=2, padx=5)
-        self.ip_entry = ttk.Entry(self.input_frame, width=20)
+        self.ip_entry = ttk.Entry(self.input_frame)
         self.ip_entry.grid(row=0, column=3, padx=5)
 
-        # Threshold input
+        # Threshold entry
         ttk.Label(self.input_frame, text="Threshold (ms):").grid(row=0, column=4, padx=5)
-        self.threshold_entry = ttk.Entry(self.input_frame, width=10)
+        self.threshold_entry = ttk.Entry(self.input_frame)
         self.threshold_entry.insert(0, "100")
         self.threshold_entry.grid(row=0, column=5, padx=5)
 
         # Add and Remove buttons
         ttk.Button(self.input_frame, text="Add Host", command=self.add_host).grid(row=0, column=6, padx=5)
-        ttk.Button(self.input_frame, text="Remove Selected", command=self.remove_host).grid(row=0, column=7, padx=5)
+        ttk.Button(self.input_frame, text="Remove Selected", command=self.remove_selected_host).grid(row=0, column=7, padx=5)
         ttk.Button(self.input_frame, text="Clear All", command=self.clear_all_hosts).grid(row=0, column=8, padx=5)
+    
+
+    def remove_selected_host(self):
+        """Remove selected host from monitoring"""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showwarning("Warning", "Please select a host to remove")
+            return
+
+        for item in selected_items:
+            values = self.tree.item(item)['values']
+            host_key = (values[0], values[1])  # hostname, ip
+
+            # Remove from monitoring
+            if host_key in self.monitoring_threads:
+                self.monitoring_threads.pop(host_key)
+
+            # Remove from hosts dictionary
+            if host_key in self.hosts:
+                self.hosts.pop(host_key)
+
+            # Remove from tree
+            self.tree.delete(item)
+
+        # Save updated hosts
+        self.save_hosts()
+        self.update_stats()
+    def clear_all_hosts(self):
+        """Remove all hosts from monitoring"""
+        for host_key in list(self.hosts.keys()):
+            item = self.hosts[host_key]
+
+            # Remove from monitoring
+            if host_key in self.monitoring_threads:
+                self.monitoring_threads.pop(host_key)
+
+            # Remove from hosts dictionary
+            if host_key in self.hosts:
+                self.hosts.pop(host_key)
+
+            # Remove from tree
+            self.tree.delete(item)
+
+        # Save updated hosts
+        self.save_hosts()
+        self.update_stats()
 
     def create_monitor_frame(self):
-        """Create the monitor frame with the treeview"""
-        self.monitor_frame = ttk.LabelFrame(self.main_frame, text="Monitor Status", padding="10")
-        self.monitor_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # Configure column headers
-        self.tree = ttk.Treeview(self.monitor_frame,
-                                 columns=("Hostname", "IP", "Status", "Ping", "Min", "Max", "Avg", "Loss%", "Threshold",
-                                          "Last Update"),
-                                 show="headings")
+        self.monitor_frame = ttk.LabelFrame(self.main_frame, text="Monitoring", padding="5")
+        self.monitor_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
         headers = {
             "Hostname": 150,
@@ -119,117 +195,44 @@ class PingMonitor:
             "Last Update": 150
         }
 
+        self.tree = ttk.Treeview(self.monitor_frame, columns=list(headers.keys()), show="headings")
+
         for header, width in headers.items():
             self.tree.heading(header, text=header)
             self.tree.column(header, width=width)
 
-        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.tree.tag_configure("good", background="#90EE90")
+        self.tree.tag_configure("high", background="#FFD700")
+        self.tree.tag_configure("critical", background="#FF6B6B")
 
-        # Add scrollbar
         scrollbar = ttk.Scrollbar(self.monitor_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.tree.configure(yscrollcommand=scrollbar.set)
 
-        # Configure monitor frame grid weights
-        self.monitor_frame.grid_rowconfigure(0, weight=1)
-        self.monitor_frame.grid_columnconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
     def create_stats_frame(self):
-        """Create the statistics frame"""
-        self.stats_frame = ttk.LabelFrame(self.main_frame, text="Statistics", padding="10")
-        self.stats_frame.grid(row=2, column=0, columnspan=2, pady=10, sticky=(tk.W, tk.E))
+        self.stats_frame = ttk.LabelFrame(self.main_frame, text="Statistics", padding="5")
+        self.stats_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
 
-        self.stats_labels = {
-            'total': ttk.Label(self.stats_frame, text="Total Hosts: 0"),
-            'active': ttk.Label(self.stats_frame, text="Active: 0"),
-            'inactive': ttk.Label(self.stats_frame, text="Inactive: 0")
-        }
+        self.stats_labels = {}
+        self.stats_labels['total'] = ttk.Label(self.stats_frame, text="Total: 0")
+        self.stats_labels['active'] = ttk.Label(self.stats_frame, text="Active: 0")
+        self.stats_labels['inactive'] = ttk.Label(self.stats_frame, text="Inactive: 0")
 
         for i, label in enumerate(self.stats_labels.values()):
-            label.grid(row=0, column=i, padx=20)
+            label.grid(row=0, column=i, padx=10)
 
-    def validate_ip(self, ip):
-        """Validate IP address format"""
-        try:
-            parts = ip.split('.')
-            return len(parts) == 4 and all(0 <= int(part) <= 255 for part in parts)
-        except (AttributeError, TypeError, ValueError):
-            return False
-
-    def validate_hostname(self, hostname):
-        """Validate hostname format"""
-        if not hostname:
-            return False
-        if len(hostname) > 255:
-            return False
-        if hostname[-1] == ".":
-            hostname = hostname[:-1]
-        allowed = re.compile("(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
-        return all(allowed.match(x) for x in hostname.split("."))
-
-    def resolve_host(self, hostname_or_ip):
+    def resolve_host(self, host):
         """Resolve hostname to IP or vice versa"""
         try:
-            if self.validate_ip(hostname_or_ip):
-                return socket.gethostbyaddr(hostname_or_ip)[0], hostname_or_ip
-            else:
-                return hostname_or_ip, socket.gethostbyname(hostname_or_ip)
-        except:
+            ip = socket.gethostbyname(host)
+            hostname = socket.gethostbyaddr(ip)[0]
+            return hostname, ip
+        except socket.error:
             return None, None
 
-    def ping(self, host):
-        """Ping the specified host and return the response time"""
-        param = '-n' if platform.system().lower() == 'windows' else '-c'
-        count_param = '1'
-        command = ['ping', param, count_param, host]
-        try:
-            output = subprocess.check_output(command, stderr=subprocess.STDOUT).decode().strip()
-            if platform.system().lower() == 'windows':
-                if 'TTL=' in output:
-                    ms = output.split('Average = ')[-1].split('ms')[0]
-                    return float(ms), True
-            else:
-                if 'time=' in output:
-                    ms = output.split('time=')[-1].split(' ')[0]
-                    return float(ms), True
-            return None, False
-        except:
-            return None, False
-
-    def monitor_host(self, hostname, ip, threshold):
-        """Continuously monitor a host and update its status"""
-        ping_history = []
-        packet_loss = 0
-        total_pings = 0
-
-        while (hostname, ip) in self.hosts:
-            total_pings += 1
-            ping_time, success = self.ping(ip)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            if success and ping_time is not None:
-                ping_history.append(ping_time)
-                if len(ping_history) > 100:  # Keep last 100 pings
-                    ping_history.pop(0)
-
-                min_ping = min(ping_history)
-                max_ping = max(ping_history)
-                avg_ping = sum(ping_history) / len(ping_history)
-                loss_percentage = (packet_loss / total_pings) * 100
-
-                status = "Good" if ping_time < threshold else "High"
-                self.queue.put((hostname, ip, status, ping_time, min_ping, max_ping, avg_ping,
-                                loss_percentage, threshold, timestamp))
-            else:
-                packet_loss += 1
-                loss_percentage = (packet_loss / total_pings) * 100
-                self.queue.put((hostname, ip, "Down", None, None, None, None,
-                                loss_percentage, threshold, timestamp))
-
-            time.sleep(2)  # Wait 2 seconds between pings
-
     def add_host(self):
-        """Add a new host to monitor"""
         hostname = self.hostname_entry.get().strip()
         ip = self.ip_entry.get().strip()
 
@@ -249,120 +252,139 @@ class PingMonitor:
             if resolved_ip:
                 ip = resolved_ip
                 hostname = resolved_hostname
+            else:
+                messagebox.showerror("Error", "Could not resolve hostname")
+                return
         elif not hostname and ip:
             resolved_hostname, resolved_ip = self.resolve_host(ip)
             if resolved_hostname:
                 hostname = resolved_hostname
-                ip = resolved_ip
+            else:
+                hostname = ip
 
-        if not ip or not hostname:
-            messagebox.showerror("Error", "Could not resolve host")
+        # Check if host already exists
+        host_key = (hostname, ip)
+        if host_key in self.hosts:
+            messagebox.showerror("Error", "Host already exists")
             return
 
-        if (hostname, ip) in self.hosts:
-            messagebox.showerror("Error", "Host already being monitored")
-            return
+        self.add_host_from_data(hostname, ip, threshold)
+        self.save_hosts()
 
-        # Test if host is reachable
-        ping_time, success = self.ping(ip)
-        if not success:
-            if not messagebox.askyesno("Warning",
-                                       "Host appears to be unreachable. Add it anyway?"):
-                return
-
-        # Add host to monitoring
-        self.hosts[(hostname, ip)] = self.tree.insert("", tk.END,
-                                                      values=(hostname, ip, "Initializing...", "", "", "", "", "", threshold,
-                                                              ""))
-
-        # Start monitoring thread
-        thread = threading.Thread(target=self.monitor_host,
-                                  args=(hostname, ip, threshold),
-                                  daemon=True)
-        self.monitoring_threads[(hostname, ip)] = thread
-        thread.start()
-
-        # Clear input fields
+        # Clear entries
         self.hostname_entry.delete(0, tk.END)
         self.ip_entry.delete(0, tk.END)
+        self.threshold_entry.delete(0, tk.END)
+        self.threshold_entry.insert(0, "100")
 
         self.update_stats()
 
-    def remove_host(self):
-        """Remove selected host from monitoring"""
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showerror("Error", "Please select a host to remove")
-            return
+    def monitor_host(self, hostname, ip, threshold):
+        """Monitor a host continuously"""
+        while self.running:
+            try:
+                ping_result = self.ping_host(ip)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        for item in selected:
-            values = self.tree.item(item)['values']
-            host_key = (values[0], values[1])  # (hostname, ip)
-            if host_key in self.hosts:
-                del self.hosts[host_key]
-                self.tree.delete(item)
+                if ping_result[0]:  # Successful ping
+                    ping_time = ping_result[1]
+                    status = "Good" if ping_time < threshold else ("High" if ping_time < threshold * 2 else "Critical")
+                    self.queue.put(
+                        (hostname, ip, status, ping_time, ping_time, ping_time, ping_time, 0, threshold, timestamp))
+                else:
+                    self.queue.put((hostname, ip, "Critical", None, None, None, None, 100, threshold, timestamp))
 
-        self.update_stats()
+                time.sleep(1)
+            except Exception as e:
+                print(f"Error monitoring {hostname}: {e}")
+                time.sleep(1)
 
-    def clear_all_hosts(self):
-        """Remove all hosts from monitoring"""
-        if messagebox.askyesno("Confirm", "Are you sure you want to remove all hosts?"):
-            self.hosts.clear()
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            self.update_stats()
+    def ping_host(self, ip):
+        """Ping a host and return success status and time"""
+        try:
+            if platform.system().lower() == "windows":
+                cmd = f"ping -n 1 {ip}"
+            else:
+                cmd = f"ping -c 1 {ip}"
+
+            start_time = time.time()
+            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            end_time = time.time()
+
+            success = result.returncode == 0
+            ping_time = (end_time - start_time) * 1000 if success else None
+
+            return success, ping_time
+        except Exception:
+            return False, None
 
     def update_stats(self):
         """Update statistics display"""
         total = len(self.hosts)
-        active = sum(1 for item in self.tree.get_children()
-                     if self.tree.item(item)['values'][2] != "Down")
+        active = sum(1 for item in self.tree.get_children() if self.tree.item(item)['values'][2] != "Critical")
         inactive = total - active
 
-        self.stats_labels['total'].configure(text=f"Total Hosts: {total}")
+        self.stats_labels['total'].configure(text=f"Total: {total}")
         self.stats_labels['active'].configure(text=f"Active: {active}")
         self.stats_labels['inactive'].configure(text=f"Inactive: {inactive}")
 
     def update_display(self):
         """Update the display with ping results"""
-        while True:
+        while self.running:
             try:
-                (hostname, ip, status, ping_time, min_ping, max_ping, avg_ping,
-                 loss_percentage, threshold, timestamp) = self.queue.get(timeout=1)
+                update = self.queue.get(timeout=0.1)
+                hostname, ip, status, ping_time, min_ping, max_ping, avg_ping, loss_percentage, threshold, timestamp = update
 
                 host_key = (hostname, ip)
                 if host_key in self.hosts:
-                    item = self.hosts[host_key]
                     ping_str = f"{ping_time:.1f}" if ping_time is not None else "N/A"
                     min_str = f"{min_ping:.1f}" if min_ping is not None else "N/A"
                     max_str = f"{max_ping:.1f}" if max_ping is not None else "N/A"
                     avg_str = f"{avg_ping:.1f}" if avg_ping is not None else "N/A"
                     loss_str = f"{loss_percentage:.1f}%" if loss_percentage is not None else "N/A"
 
-                    # Set tag for row color
-                    if status == "Good":
-                        tag = "good"
-                        self.tree.tag_configure(tag, background="#90EE90")  # Light green
-                    elif status == "High":
-                        tag = "high"
-                        self.tree.tag_configure(tag, background="#FFB6C1")  # Light red
-                    else:
-                        tag = "down"
-                        self.tree.tag_configure(tag, background="#D3D3D3")  # Light gray
+                    tag = "good" if status == "Good" else ("high" if status == "High" else "critical")
 
-                    self.tree.item(item, values=(
-                        hostname, ip, status, ping_str, min_str, max_str,
-                        avg_str, loss_str, threshold, timestamp
-                    ), tags=(tag,))
-
+                    self.tree.item(
+                        self.hosts[host_key],
+                        values=(
+                            hostname, ip, status, ping_str, min_str, max_str,
+                            avg_str, loss_str, threshold, timestamp
+                        ),
+                        tags=(tag,)
+                    )
                     self.update_stats()
-
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Error updating display: {e}")
+            finally:
+                time.sleep(0.1)
+
+    def on_closing(self):
+        """Handle application closing"""
+        self.save_hosts()  # Save hosts before closing
+        self.running = False
+        for thread in self.monitoring_threads.values():
+            thread.join(timeout=1)
+        self.root.destroy()
+        sys.exit(0)
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = PingMonitor(root)
-    root.mainloop()
+    try:
+        # Hide console window on Windows
+        if platform.system() == "Windows":
+            import ctypes
+
+            ctypes.windll.user32.ShowWindow(
+                ctypes.windll.kernel32.GetConsoleWindow(), 0)
+
+        me = singleton.SingleInstance()
+        root = tk.Tk()
+        app = PingMonitor(root)
+        root.mainloop()
+
+    except singleton.SingleInstanceException:
+        messagebox.showerror("Error", "Application is already running!")
+        sys.exit(1)
