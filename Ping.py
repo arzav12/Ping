@@ -10,26 +10,40 @@ import socket
 import re
 from tendo import singleton
 import sys
+import json
+import os
+
 
 class PingMonitor:
     def __init__(self, root):
         self.root = root
         self.root.title("Advanced Network Ping Monitor")
         self.root.geometry("1000x700")
-        
+
+        # Data storage file path
+        self.data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'host_data.json')
+
         # Add window control
         self.root.withdraw()  # Hide initially
         self.running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
+        
+        # Add responsive configuration
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        
         # Store hosts and their monitoring threads
         self.hosts = {}
         self.monitoring_threads = {}
         self.queue = queue.Queue()
 
         # Create main frame
+        # Update main frame (around line 35)
         self.main_frame = ttk.Frame(self.root, padding="10")
-        self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.main_frame.grid(row=0, column=0, sticky='nsew')
+        self.main_frame.grid_rowconfigure(1, weight=1)  # Monitor frame row
+        self.main_frame.grid_columnconfigure(0, weight=1)
+
 
         # Create frames
         self.create_input_frame()
@@ -41,12 +55,65 @@ class PingMonitor:
         self.root.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=1)
 
+        # Load saved hosts
+        self.load_hosts()
+
         # Start update thread
         self.update_thread = threading.Thread(target=self.update_display, daemon=True)
         self.update_thread.start()
 
         # Show window after initialization
         self.root.after(100, self.root.deiconify)
+
+    def load_hosts(self):
+        """Load saved hosts from JSON file"""
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r') as f:
+                    saved_hosts = json.load(f)
+                    for host_data in saved_hosts:
+                        self.add_host_from_data(
+                            host_data['hostname'],
+                            host_data['ip'],
+                            float(host_data['threshold'])
+                        )
+        except Exception as e:
+            messagebox.showwarning("Warning", f"Error loading saved hosts: {str(e)}")
+
+    def save_hosts(self):
+        """Save hosts to JSON file"""
+        try:
+            hosts_data = []
+            for (hostname, ip) in self.hosts.keys():
+                item = self.hosts[(hostname, ip)]
+                values = self.tree.item(item)['values']
+                hosts_data.append({
+                    'hostname': hostname,
+                    'ip': ip,
+                    'threshold': values[8]  # threshold value
+                })
+
+            with open(self.data_file, 'w') as f:
+                json.dump(hosts_data, f, indent=4)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"Error saving hosts: {str(e)}")
+
+    def add_host_from_data(self, hostname, ip, threshold):
+        """Add a host from saved data"""
+        host_key = (hostname, ip)
+        if host_key not in self.hosts:
+            item = self.tree.insert("", tk.END, values=(
+                hostname, ip, "Unknown", "N/A", "N/A", "N/A", "N/A", "N/A", threshold, "N/A"
+            ))
+            self.hosts[host_key] = item
+
+            thread = threading.Thread(
+                target=self.monitor_host,
+                args=(hostname, ip, threshold),
+                daemon=True
+            )
+            self.monitoring_threads[host_key] = thread
+            thread.start()
 
     def create_input_frame(self):
         self.input_frame = ttk.LabelFrame(self.main_frame, text="Add Host", padding="5")
@@ -68,13 +135,64 @@ class PingMonitor:
         self.threshold_entry.insert(0, "100")
         self.threshold_entry.grid(row=0, column=5, padx=5)
 
-        # Add button
-        self.add_button = ttk.Button(self.input_frame, text="Add Host", command=self.add_host)
-        self.add_button.grid(row=0, column=6, padx=5)
+        # Add and Remove buttons
+        ttk.Button(self.input_frame, text="Add Host", command=self.add_host).grid(row=0, column=6, padx=5)
+        ttk.Button(self.input_frame, text="Remove Selected", command=self.remove_selected_host).grid(row=0, column=7, padx=5)
+        ttk.Button(self.input_frame, text="Clear All", command=self.clear_all_hosts).grid(row=0, column=8, padx=5)
+    
+
+    def remove_selected_host(self):
+        """Remove selected host from monitoring"""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showwarning("Warning", "Please select a host to remove")
+            return
+
+        for item in selected_items:
+            values = self.tree.item(item)['values']
+            host_key = (values[0], values[1])  # hostname, ip
+
+            # Remove from monitoring
+            if host_key in self.monitoring_threads:
+                self.monitoring_threads.pop(host_key)
+
+            # Remove from hosts dictionary
+            if host_key in self.hosts:
+                self.hosts.pop(host_key)
+
+            # Remove from tree
+            self.tree.delete(item)
+
+        # Save updated hosts
+        self.save_hosts()
+        self.update_stats()
+    def clear_all_hosts(self):
+        """Remove all hosts from monitoring"""
+        for host_key in list(self.hosts.keys()):
+            item = self.hosts[host_key]
+
+            # Remove from monitoring
+            if host_key in self.monitoring_threads:
+                self.monitoring_threads.pop(host_key)
+
+            # Remove from hosts dictionary
+            if host_key in self.hosts:
+                self.hosts.pop(host_key)
+
+            # Remove from tree
+            self.tree.delete(item)
+
+        # Save updated hosts
+        self.save_hosts()
+        self.update_stats()
 
     def create_monitor_frame(self):
         self.monitor_frame = ttk.LabelFrame(self.main_frame, text="Monitoring", padding="5")
-        self.monitor_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.monitor_frame.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=5)
+    
+    # Make monitor frame responsive
+        self.monitor_frame.grid_rowconfigure(0, weight=1)
+        self.monitor_frame.grid_columnconfigure(0, weight=1)
 
         headers = {
             "Hostname": 150,
@@ -90,20 +208,23 @@ class PingMonitor:
         }
 
         self.tree = ttk.Treeview(self.monitor_frame, columns=list(headers.keys()), show="headings")
-        
+        self.tree.grid(row=0, column=0, sticky='nsew')
+
         for header, width in headers.items():
             self.tree.heading(header, text=header)
             self.tree.column(header, width=width)
 
-        self.tree.tag_configure("good", background="#90EE90")  # Light green
-        self.tree.tag_configure("high", background="#FFD700")  # Gold
-        self.tree.tag_configure("critical", background="#FF6B6B")  # Light red
+        self.tree.tag_configure("good", background="#90EE90")
+        self.tree.tag_configure("high", background="#FFD700")
+        self.tree.tag_configure("critical", background="#FF6B6B")
 
-        scrollbar = ttk.Scrollbar(self.monitor_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        # Add scrollbars
+        vsb = ttk.Scrollbar(self.monitor_frame, orient="vertical", command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb = ttk.Scrollbar(self.monitor_frame, orient="horizontal", command=self.tree.xview)
+        hsb.grid(row=1, column=0, sticky='ew')
+    
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
     def create_stats_frame(self):
         self.stats_frame = ttk.LabelFrame(self.main_frame, text="Statistics", padding="5")
@@ -118,6 +239,7 @@ class PingMonitor:
             label.grid(row=0, column=i, padx=10)
 
     def resolve_host(self, host):
+        """Resolve hostname to IP or vice versa"""
         try:
             ip = socket.gethostbyname(host)
             hostname = socket.gethostbyaddr(ip)[0]
@@ -153,7 +275,7 @@ class PingMonitor:
             if resolved_hostname:
                 hostname = resolved_hostname
             else:
-                hostname = ip  # Use IP as hostname if resolution fails
+                hostname = ip
 
         # Check if host already exists
         host_key = (hostname, ip)
@@ -161,13 +283,8 @@ class PingMonitor:
             messagebox.showerror("Error", "Host already exists")
             return
 
-        # Add to treeview and start monitoring
-        item = self.tree.insert("", tk.END, values=(hostname, ip, "Unknown", "N/A", "N/A", "N/A", "N/A", "N/A", threshold, "N/A"))
-        self.hosts[host_key] = item
-
-        thread = threading.Thread(target=self.monitor_host, args=(hostname, ip, threshold), daemon=True)
-        self.monitoring_threads[host_key] = thread
-        thread.start()
+        self.add_host_from_data(hostname, ip, threshold)
+        self.save_hosts()
 
         # Clear entries
         self.hostname_entry.delete(0, tk.END)
@@ -177,43 +294,59 @@ class PingMonitor:
 
         self.update_stats()
 
-    def monitor_host(self, hostname, ip, threshold):
-        while self.running:
-            try:
-                ping_result = self.ping_host(ip)
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                if ping_result[0]:  # Successful ping
-                    ping_time = ping_result[1]
-                    status = "Good" if ping_time < threshold else ("High" if ping_time < threshold * 2 else "Critical")
-                    self.queue.put((hostname, ip, status, ping_time, ping_time, ping_time, ping_time, 0, threshold, timestamp))
-                else:
-                    self.queue.put((hostname, ip, "Critical", None, None, None, None, 100, threshold, timestamp))
-                
-                time.sleep(1)
-            except Exception as e:
-                print(f"Error monitoring {hostname}: {e}")
-                time.sleep(1)
-
-    def ping_host(self, ip):
+    def ping(self, ip):
+        """Perform a single ping and return (ping_time, success)"""
         try:
             if platform.system().lower() == "windows":
                 cmd = f"ping -n 1 {ip}"
             else:
                 cmd = f"ping -c 1 {ip}"
-            
+
             start_time = time.time()
             result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             end_time = time.time()
-            
+
             success = result.returncode == 0
             ping_time = (end_time - start_time) * 1000 if success else None
-            
-            return success, ping_time
+
+            return ping_time, success
         except Exception:
-            return False, None
+            return None, False
+
+    def monitor_host(self, hostname, ip, threshold):
+        """Continuously monitor a host and update its status"""
+        ping_history = []
+        packet_loss = 0
+        total_pings = 0
+
+        while (hostname, ip) in self.hosts:
+            total_pings += 1
+            ping_time, success = self.ping(ip)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if success and ping_time is not None:
+                ping_history.append(ping_time)
+                if len(ping_history) > 100:  # Keep last 100 pings
+                    ping_history.pop(0)
+
+                min_ping = min(ping_history)
+                max_ping = max(ping_history)
+                avg_ping = sum(ping_history) / len(ping_history)
+                loss_percentage = (packet_loss / total_pings) * 100
+
+                status = "Good" if ping_time < threshold else "High"
+                self.queue.put((hostname, ip, status, ping_time, min_ping, max_ping, avg_ping,
+                                loss_percentage, threshold, timestamp))
+            else:
+                packet_loss += 1
+                loss_percentage = (packet_loss / total_pings) * 100
+                self.queue.put((hostname, ip, "Down", None, None, None, None,
+                                loss_percentage, threshold, timestamp))
+
+            time.sleep(2)  # Wait 2 seconds between pings
 
     def update_stats(self):
+        """Update statistics display"""
         total = len(self.hosts)
         active = sum(1 for item in self.tree.get_children() if self.tree.item(item)['values'][2] != "Critical")
         inactive = total - active
@@ -223,11 +356,12 @@ class PingMonitor:
         self.stats_labels['inactive'].configure(text=f"Inactive: {inactive}")
 
     def update_display(self):
+        """Update the display with ping results"""
         while self.running:
             try:
                 update = self.queue.get(timeout=0.1)
                 hostname, ip, status, ping_time, min_ping, max_ping, avg_ping, loss_percentage, threshold, timestamp = update
-                
+
                 host_key = (hostname, ip)
                 if host_key in self.hosts:
                     ping_str = f"{ping_time:.1f}" if ping_time is not None else "N/A"
@@ -237,7 +371,7 @@ class PingMonitor:
                     loss_str = f"{loss_percentage:.1f}%" if loss_percentage is not None else "N/A"
 
                     tag = "good" if status == "Good" else ("high" if status == "High" else "critical")
-                    
+
                     self.tree.item(
                         self.hosts[host_key],
                         values=(
@@ -255,25 +389,29 @@ class PingMonitor:
                 time.sleep(0.1)
 
     def on_closing(self):
+        """Handle application closing"""
+        self.save_hosts()  # Save hosts before closing
         self.running = False
         for thread in self.monitoring_threads.values():
             thread.join(timeout=1)
         self.root.destroy()
         sys.exit(0)
 
+
 if __name__ == "__main__":
     try:
-        # Hide console window
+        # Hide console window on Windows
         if platform.system() == "Windows":
             import ctypes
+
             ctypes.windll.user32.ShowWindow(
                 ctypes.windll.kernel32.GetConsoleWindow(), 0)
-        
+
         me = singleton.SingleInstance()
         root = tk.Tk()
         app = PingMonitor(root)
         root.mainloop()
-        
+
     except singleton.SingleInstanceException:
         messagebox.showerror("Error", "Application is already running!")
         sys.exit(1)

@@ -1,0 +1,7 @@
+[
+    {
+        "hostname": "google",
+        "ip": "8.8.8.8",
+        "threshold": "100.0"
+    }
+]
