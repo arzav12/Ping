@@ -8,10 +8,10 @@ import time
 from datetime import datetime
 import socket
 import re
-from tendo import singleton
 import sys
 import json
 import os
+import tempfile
 
 
 class PingMonitor:
@@ -20,8 +20,15 @@ class PingMonitor:
         self.root.title("Advanced Network Ping Monitor")
         self.root.geometry("1000x700")
 
-        # Data storage file path
-        self.data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'host_data.json')
+        # Update data file path to work with PyInstaller
+        if getattr(sys, 'frozen', False):
+            # If running as exe (PyInstaller)
+            application_path = os.path.dirname(sys.executable)
+        else:
+            # If running as script
+            application_path = os.path.dirname(os.path.abspath(__file__))
+        
+        self.data_file = os.path.join(application_path, 'host_data.json')
 
         # Add window control
         self.root.withdraw()  # Hide initially
@@ -77,8 +84,10 @@ class PingMonitor:
                             host_data['ip'],
                             float(host_data['threshold'])
                         )
-        except Exception as e:
-            messagebox.showwarning("Warning", f"Error loading saved hosts: {str(e)}")
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+            # Don't show error on first run
+            if os.path.exists(self.data_file):
+                messagebox.showwarning("Warning", f"Error loading saved hosts: {str(e)}")
 
     def save_hosts(self):
         """Save hosts to JSON file"""
@@ -93,6 +102,9 @@ class PingMonitor:
                     'threshold': values[8]  # threshold value
                 })
 
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+            
             with open(self.data_file, 'w') as f:
                 json.dump(hosts_data, f, indent=4)
         except Exception as e:
@@ -403,15 +415,39 @@ if __name__ == "__main__":
         # Hide console window on Windows
         if platform.system() == "Windows":
             import ctypes
-
             ctypes.windll.user32.ShowWindow(
                 ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
-        me = singleton.SingleInstance()
+        # Create a unique temp file for this user
+        lock_file = os.path.join(tempfile.gettempdir(), 'ping_monitor.lock')
+        
+        if os.path.exists(lock_file):
+            try:
+                # Try to remove the lock file if it's stale
+                os.remove(lock_file)
+            except PermissionError:
+                # If we can't remove it, another instance is running
+                messagebox.showerror("Error", "Application is already running!")
+                sys.exit(1)
+                
+        # Create the lock file
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+
         root = tk.Tk()
         app = PingMonitor(root)
+        
+        def cleanup():
+            try:
+                os.remove(lock_file)
+            except:
+                pass
+            root.destroy()
+            sys.exit(0)
+            
+        root.protocol("WM_DELETE_WINDOW", cleanup)
         root.mainloop()
 
-    except singleton.SingleInstanceException:
-        messagebox.showerror("Error", "Application is already running!")
+    except Exception as e:
+        messagebox.showerror("Error", f"Unexpected error: {str(e)}")
         sys.exit(1)
