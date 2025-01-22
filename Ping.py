@@ -27,15 +27,23 @@ class PingMonitor:
         self.root.withdraw()  # Hide initially
         self.running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
+        
+        # Add responsive configuration
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        
         # Store hosts and their monitoring threads
         self.hosts = {}
         self.monitoring_threads = {}
         self.queue = queue.Queue()
 
         # Create main frame
+        # Update main frame (around line 35)
         self.main_frame = ttk.Frame(self.root, padding="10")
-        self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.main_frame.grid(row=0, column=0, sticky='nsew')
+        self.main_frame.grid_rowconfigure(1, weight=1)  # Monitor frame row
+        self.main_frame.grid_columnconfigure(0, weight=1)
+
 
         # Create frames
         self.create_input_frame()
@@ -180,7 +188,11 @@ class PingMonitor:
 
     def create_monitor_frame(self):
         self.monitor_frame = ttk.LabelFrame(self.main_frame, text="Monitoring", padding="5")
-        self.monitor_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.monitor_frame.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=5)
+    
+    # Make monitor frame responsive
+        self.monitor_frame.grid_rowconfigure(0, weight=1)
+        self.monitor_frame.grid_columnconfigure(0, weight=1)
 
         headers = {
             "Hostname": 150,
@@ -196,6 +208,7 @@ class PingMonitor:
         }
 
         self.tree = ttk.Treeview(self.monitor_frame, columns=list(headers.keys()), show="headings")
+        self.tree.grid(row=0, column=0, sticky='nsew')
 
         for header, width in headers.items():
             self.tree.heading(header, text=header)
@@ -205,11 +218,13 @@ class PingMonitor:
         self.tree.tag_configure("high", background="#FFD700")
         self.tree.tag_configure("critical", background="#FF6B6B")
 
-        scrollbar = ttk.Scrollbar(self.monitor_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        # Add scrollbars
+        vsb = ttk.Scrollbar(self.monitor_frame, orient="vertical", command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb = ttk.Scrollbar(self.monitor_frame, orient="horizontal", command=self.tree.xview)
+        hsb.grid(row=1, column=0, sticky='ew')
+    
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
     def create_stats_frame(self):
         self.stats_frame = ttk.LabelFrame(self.main_frame, text="Statistics", padding="5")
