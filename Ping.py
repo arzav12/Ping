@@ -8,9 +8,79 @@ import time
 from datetime import datetime
 import socket
 import sys
-import mysql.connector
-from mysql.connector import Error
-import os  # Add this import at the top with other imports
+import json
+import os
+import tempfile
+import atexit
+import psutil
+
+def get_application_path():
+    """Get correct application path whether running as script or frozen exe"""
+    if getattr(sys, 'frozen', False):
+        # Running as compiled exe
+        return os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        return os.path.dirname(os.path.abspath(__file__))
+
+def create_lock_file():
+    """Create a lock file to prevent multiple instances"""
+    lock_file = os.path.join(tempfile.gettempdir(), 'network_monitor.lock')
+    
+    # Check if process is actually running
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, 'r') as f:
+                pid = int(f.read().strip())
+            if psutil.pid_exists(pid):
+                return False  # Another instance is running
+            else:
+                # Stale lock file
+                os.remove(lock_file)
+        except (ValueError, IOError):
+            # Invalid or inaccessible lock file
+            try:
+                os.remove(lock_file)
+            except OSError:
+                return False
+
+    # Create new lock file
+    try:
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+        atexit.register(lambda: os.remove(lock_file))
+        return True
+    except IOError:
+        return False
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource for both dev and PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def is_already_running():
+    """Check if another instance is running using process name and window title"""
+    current_pid = os.getpid()
+    current_process = psutil.Process(current_pid)
+    current_name = current_process.name()
+    
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            if proc.info['pid'] != current_pid and proc.info['name'] == current_name:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return False
+
+def get_app_data_path():
+    """Get the appropriate application data path"""
+    if platform.system() == "Windows":
+        return os.path.join(os.environ['LOCALAPPDATA'], 'NetworkMonitor')
+    return os.path.join(os.path.expanduser('~'), '.networkmonitor')
 
 class PingMonitor:
     def __init__(self, root):
@@ -18,229 +88,90 @@ class PingMonitor:
         self.root.title("Advanced Network Ping Monitor")
         self.root.geometry("1000x700")
 
-        # Database configuration
-        self.db_config = {
-            'host': 'localhost',
-            'user': 'root',
-            'password': '@123@',
-            'database': 'network_monitor'
-        }
-        
-        # Clean up any stale instances first
-        self.cleanup_stale_instances()
-        
-        # Check for running instance using MySQL
-        if self.is_application_running():
-            messagebox.showerror("Error", "Application is already running!")
-            root.destroy()  # Properly destroy the root window
-            sys.exit(1)
-        
-        # Continue with initialization only if no other instance is running
-        self.init_application()
+        # Set up application paths
+        self.app_data_path = get_app_data_path()
+        os.makedirs(self.app_data_path, exist_ok=True)
+        self.data_file = os.path.join(self.app_data_path, 'host_data.json')
 
-    def cleanup_stale_instances(self):
-        """Clean up stale application instances"""
+        # Initialize application with error handling
         try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            # Remove instances that haven't updated heartbeat in 30 seconds
-            cursor.execute("""
-                DELETE FROM app_instances 
-                WHERE last_heartbeat < NOW() - INTERVAL 30 SECOND
-            """)
-            
-            # Also clean up any orphaned instances
-            if platform.system().lower() == "windows":
-                cursor.execute("SELECT pid FROM app_instances")
-                for (pid,) in cursor.fetchall():
-                    try:
-                        import psutil
-                        if not psutil.pid_exists(pid):
-                            cursor.execute("DELETE FROM app_instances WHERE pid = %s", (pid,))
-                    except ImportError:
-                        pass  # psutil not installed
-            
-            conn.commit()
-        except Error as e:
-            print(f"Error cleaning up stale instances: {e}")
-        finally:
-            if 'conn' in locals() and conn.is_connected():
-                cursor.close()
-                conn.close()
+            self.init_application()
+        except Exception as e:
+            messagebox.showerror("Initialization Error", str(e))
+            self.root.destroy()
+            sys.exit(1)
 
     def init_application(self):
-        """Initialize the application after instance check"""
-        try:
-            # Register this instance first
-            self.register_instance()
-            
-            # Initialize database
-            self.init_database()
-            
-            # Continue with rest of initialization
-            self.running = True
-            self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        """Initialize the application components"""
+        # Add window control
+        self.root.withdraw()  # Hide initially
+        self.running = True
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-            # Add responsive configuration
-            self.root.grid_rowconfigure(0, weight=1)
-            self.root.grid_columnconfigure(0, weight=1)
+        # Store hosts and their monitoring threads
+        self.hosts = {}
+        self.monitoring_threads = {}
+        self.queue = queue.Queue()
+
+        # Create frames
+        self.create_main_frame()
+        self.create_input_frame()
+        self.create_monitor_frame()
+        self.create_stats_frame()
+
+        # Load saved hosts
+        self.load_hosts()
+
+        # Start update thread
+        self.update_thread = threading.Thread(target=self.update_display, daemon=True)
+        self.update_thread.start()
+
+        # Show window after initialization
+        self.root.after(100, self.root.deiconify)
+
+    def create_main_frame(self):
+        """Create and configure main frame"""
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.grid(row=0, column=0, sticky='nsew')
         
-            # Store hosts and their monitoring threads
-            self.hosts = {}
-            self.monitoring_threads = {}
-            self.queue = queue.Queue()
-
-            # Create main frame
-            # Update main frame (around line 35)
-            self.main_frame = ttk.Frame(self.root, padding="10")
-            self.main_frame.grid(row=0, column=0, sticky='nsew')
-            self.main_frame.grid_rowconfigure(1, weight=1)  # Monitor frame row
-            self.main_frame.grid_columnconfigure(0, weight=1)
-
-
-            # Create frames
-            self.create_input_frame()
-            self.create_monitor_frame()
-            self.create_stats_frame()
-
-            # Configure grid weights
-            self.root.grid_rowconfigure(0, weight=1)
-            self.root.grid_columnconfigure(0, weight=1)
-            self.main_frame.grid_columnconfigure(1, weight=1)
-
-            # Load saved hosts
-            self.load_hosts()
-
-            # Start update thread
-            self.update_thread = threading.Thread(target=self.update_display, daemon=True)
-            self.update_thread.start()
-
-            # Show window after initialization
-            self.root.after(100, self.root.deiconify)
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to initialize application: {str(e)}")
-            self.on_closing()  # Clean up and exit
-
-    def init_database(self):
-        """Initialize database connection"""
-        try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            cursor.close()
-            conn.close()
-        except mysql.connector.Error as e:
-            messagebox.showerror("Database Error", f"Failed to connect to database: {str(e)}")
-            sys.exit(1)
-
-    def is_application_running(self):
-        """Check if another instance is running using MySQL"""
-        try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            # Check for active instances
-            cursor.execute("SELECT COUNT(*) FROM app_instances")
-            count = cursor.fetchone()[0]
-            
-            return count > 0
-        except Error as e:
-            messagebox.showerror("Database Error", f"Failed to check instance: {str(e)}")
-            return True  # Assume running if can't check
-        finally:
-            if conn.is_connected():
-                cursor.close()
-                conn.close()
-
-    def register_instance(self):
-        """Register this instance in the database"""
-        try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO app_instances (pid, last_heartbeat) 
-                VALUES (%s, NOW())
-            """, (os.getpid(),))
-            
-            conn.commit()
-            self.instance_id = cursor.lastrowid
-            
-            # Start heartbeat thread
-            self.heartbeat_thread = threading.Thread(target=self.update_heartbeat, daemon=True)
-            self.heartbeat_thread.start()
-        except Error as e:
-            messagebox.showerror("Database Error", f"Failed to register instance: {str(e)}")
-            sys.exit(1)
-        finally:
-            if conn.is_connected():
-                cursor.close()
-                conn.close()
-
-    def update_heartbeat(self):
-        """Periodically update instance heartbeat"""
-        while self.running:
-            try:
-                conn = mysql.connector.connect(**self.db_config)
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    UPDATE app_instances 
-                    SET last_heartbeat = NOW() 
-                    WHERE id = %s
-                """, (self.instance_id,))
-                
-                conn.commit()
-            except Error:
-                pass
-            finally:
-                if conn.is_connected():
-                    cursor.close()
-                    conn.close()
-            time.sleep(10)
+        # Configure weights
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(1, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
 
     def load_hosts(self):
-        """Load saved hosts from database"""
+        """Load saved hosts from JSON file"""
         try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT hostname, ip, threshold FROM hosts")
-            for (hostname, ip, threshold) in cursor:
-                self.add_host_from_data(hostname, ip, threshold)
-        except Error as e:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r') as f:
+                    saved_hosts = json.load(f)
+                    for host_data in saved_hosts:
+                        self.add_host_from_data(
+                            host_data['hostname'],
+                            host_data['ip'],
+                            float(host_data['threshold'])
+                        )
+        except Exception as e:
             messagebox.showwarning("Warning", f"Error loading saved hosts: {str(e)}")
-        finally:
-            if conn.is_connected():
-                cursor.close()
-                conn.close()
 
     def save_hosts(self):
-        """Save hosts to database"""
+        """Save hosts to JSON file with error handling"""
         try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            # Clear existing hosts
-            cursor.execute("DELETE FROM hosts")
-            
-            # Insert current hosts
-            for (hostname, ip) in self.hosts.keys():
-                item = self.hosts[(hostname, ip)]
-                values = self.tree.item(item)['values']
-                cursor.execute("""
-                    INSERT INTO hosts (hostname, ip, threshold) 
-                    VALUES (%s, %s, %s)
-                """, (hostname, ip, values[8]))
-            
-            conn.commit()
-        except Error as e:
+            os.makedirs(self.app_data_path, exist_ok=True)
+            with open(self.data_file, 'w') as f:
+                hosts_data = []
+                for (hostname, ip) in self.hosts.keys():
+                    item = self.hosts[(hostname, ip)]
+                    values = self.tree.item(item)['values']
+                    hosts_data.append({
+                        'hostname': hostname,
+                        'ip': ip,
+                        'threshold': values[8]
+                    })
+                json.dump(hosts_data, f, indent=4)
+        except Exception as e:
             messagebox.showwarning("Warning", f"Error saving hosts: {str(e)}")
-        finally:
-            if conn.is_connected():
-                cursor.close()
-                conn.close()
 
     def add_host_from_data(self, hostname, ip, threshold):
         """Add a host from saved data"""
@@ -535,52 +466,68 @@ class PingMonitor:
     def on_closing(self):
         """Handle application closing"""
         try:
-            # Save hosts before closing
             self.save_hosts()
-            
-            # Remove instance registration
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM app_instances WHERE id = %s", (self.instance_id,))
-            conn.commit()
-            
             self.running = False
+            
+            # Stop all monitoring threads
             for thread in self.monitoring_threads.values():
                 thread.join(timeout=1)
-                
-        except Error as e:
-            print(f"Error during cleanup: {e}")
+            
+            # Clean up temp files
+            lock_file = os.path.join(tempfile.gettempdir(), 'network_monitor.lock')
+            if os.path.exists(lock_file):
+                try:
+                    os.remove(lock_file)
+                except OSError:
+                    pass
+                    
         finally:
-            if 'conn' in locals() and conn.is_connected():
-                cursor.close()
-                conn.close()
+            self.root.quit()
             self.root.destroy()
-            sys.exit(0)
-
 
 if __name__ == "__main__":
     try:
-        # Optional: Install psutil for better process checking
-        try:
-            import psutil
-        except ImportError:
-            pass
-
-        # Hide console window on Windows
+        # Ensure single instance using a more reliable method
+        mutex_name = "Global\\NetworkMonitorMutex"
         if platform.system() == "Windows":
-            import ctypes
+            try:
+                import win32event
+                import win32api
+                import winerror
+                mutex = win32event.CreateMutex(None, 1, mutex_name)
+                if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+                    messagebox.showerror("Error", "Application is already running!")
+                    sys.exit(1)
+            except ImportError:
+                # Fallback to basic process check if win32 is not available
+                if is_already_running():
+                    messagebox.showerror("Error", "Application is already running!")
+                    sys.exit(1)
+        else:
+            # Use file-based lock for non-Windows systems
+            lock_file = os.path.join(tempfile.gettempdir(), 'network_monitor.lock')
+            if os.path.exists(lock_file):
+                try:
+                    with open(lock_file, 'r') as f:
+                        pid = int(f.read().strip())
+                    if psutil.pid_exists(pid):
+                        messagebox.showerror("Error", "Application is already running!")
+                        sys.exit(1)
+                except:
+                    pass
+            with open(lock_file, 'w') as f:
+                f.write(str(os.getpid()))
 
+        # Hide console in frozen mode
+        if getattr(sys, 'frozen', False) and platform.system() == "Windows":
+            import ctypes
             ctypes.windll.user32.ShowWindow(
                 ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
-        # Create database if it doesn't exist
         root = tk.Tk()
         app = PingMonitor(root)
         root.mainloop()
 
-    except mysql.connector.Error as e:
-        messagebox.showerror("Database Error", f"Database connection failed: {str(e)}")
-        sys.exit(1)
     except Exception as e:
         messagebox.showerror("Error", f"Application error: {str(e)}")
         sys.exit(1)
